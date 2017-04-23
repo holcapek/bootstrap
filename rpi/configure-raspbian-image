@@ -1,0 +1,246 @@
+#!/bin/bash
+
+action=
+force=
+image=
+env=
+
+# first colon implies silent errors
+while getopts ':dfci:e:h' OPTNAME
+do
+	case "${OPTNAME}" in
+		(d)
+			action=download
+			;;
+		(f)
+			force=yes
+			;;
+		(c)
+			action=configure
+			;;
+		(i)
+			image="${OPTARG}"
+			;;
+		(e)
+			env="${OPTARG}"
+			;;
+		(h)
+			cat <<EOI
+
+$0
+
+	-d	download latest Raspbian image
+	-c	configure Raspbian image
+	-f	force overwriting existing file;
+		with -d, force overwriting existing
+		image archive (.zip);
+		with -c, force overwriting existing
+		image (.img) from the image archive
+	-e	enf file; file containing these
+		variables:
+		- hostname
+		- tz (timezone)
+		- ssid (wireless network id)
+		- psk (wireless network password)
+
+EOI
+			exit 0
+			;;
+		(*)
+			echo "Unknown option '${OPTARG}'"
+			exit 1
+			;;
+	esac
+done
+
+function download_latest_image() {
+	local force=$1
+
+	curl_cmd="curl -o /dev/null --dump-header - --silent --show-error https://downloads.raspberrypi.org/raspbian_lite_latest"
+	location_header=$(${curl_cmd} | grep '^Location:')
+	image_url=$(echo ${location_header} | sed 's/^Location: \+//; s/\r$//')
+	image_basename=$(basename "${image_url}")
+	if [[ -f "${image_basename}" ]]
+	then
+		if [[ -z "${force}" ]]
+		then
+			echo "Error: image file '${image_basename}' already exists"
+			echo "Hint: use -f to force overwriting existing image file"
+			exit 1
+		fi
+		echo "Warning: image file '$image_basename' already exists, will be overwritten"
+	fi
+	curl --location -# -o "${image_basename}" "${image_url}"
+	echo "Image '${image_basename} downloaded"
+	exit 0
+}
+
+function set_timezone() {
+	local file=$1
+	local tz=$2
+	echo "${tz}" > ${file}
+}
+
+function set_hostname() {
+	local file=$1
+	local hostname=$2
+	echo "${hostname}" > ${file}
+}
+
+function set_wpa_supplicant() {
+	local file=$1
+	local ssid=$2
+	local psk=$3
+	cat > "${file}" <<EOI
+country=CZ
+ctrl_interface=DIR=/var/run/wpa_supplicant GROUP=netdev
+update_config=1
+network={
+	ssid="${ssid}"
+	proto=WPA
+	key_mgmt=WPA-PSK
+	psk="${psk}"
+}
+EOI
+}
+
+function set_interfaces() {
+	local file=$1
+	cat > "${file}" <<EOI
+source-directory /etc/network/interfaces.d
+
+auto lo
+iface lo inet loopback
+EOI
+	cat > "${file}.d/wlan0" <<EOI
+allow-hotplug wlan0
+iface wlan0 inet dhcp
+    wpa-conf /etc/wpa_supplicant/wpa_supplicant.conf
+EOI
+}
+
+function configure_raspbian_image {
+	local image=$1
+	local env=$2
+
+	local whoami=$(whoami)
+	if [[ ! "${whoami}" == 'root' ]]
+	then
+		echo "Error: must run as root"
+		exit 1
+	fi
+
+	if [[ -z "${image}" ]]
+	then
+		echo "Error: missing image"
+		echo "Hint: use -i <img> to specify image file"
+		exit 1
+	fi
+
+	if [[ ! -f "${image}" ]]
+	then
+		echo "Error: image file '${image}' does not exist"
+		exit 1
+	fi
+
+	if [[ -z "${env}" ]]
+	then
+		echo "Error: missing env file"
+		echo "Hint: use -e <env-file>"
+		exit 1
+	fi
+
+	if [[ ! -f "${env}" ]]
+	then
+		echo "Error: env file '${env}' does not exist"
+		exit 1
+	fi
+
+	env_file=$(mktemp env-XXXXXX)
+	grep -E '^(hostname|tz|ssid|psk)=' "${env}" > "${env_file}"
+
+	. "${env_file}"
+
+	rm -f "${env_file}"
+
+	if [[ -z "${hostname}" ]]
+	then
+		echo "Error: missing hostname"
+		exit 1
+	fi
+
+	if [[ -z "${ssid}" ]]
+	then
+		echo "Error: missing ssid"
+		exit 1
+	fi
+
+	if [[ -z "${psk}" ]]
+	then
+		echo "Error: missing psk"
+		exit 1
+	fi
+
+	mount_image="${image}"
+
+	is_zip_image=$(echo "${image}" | grep -o '.zip$' || true)
+	if [[ "${is_zip_image}" ]]
+	then
+		mount_image=$(basename "${image}" .zip).img 
+		echo "Info: zip image file, going to extract '${mount_image}'"
+		if [[ -f "${mount_image}" ]]
+		then
+			if [[ -z "${force}" ]]	
+			then
+				echo "Error: image file '${mount_image} already exists"
+				echo "Hint: use -f to force overwriting existing image file"
+				exit 1
+			fi
+			echo "Warning: image file '${mount_image}' already exists, will be overwritten"
+		fi
+		unzip -o "${image}" "${mount_image}"
+	fi
+
+	boot_part_start=$(parted -s -m "${mount_image}" 'unit B print' | grep '^1:' | cut -d: -f2 | sed 's/B$//')
+	root_part_start=$(parted -s -m "${mount_image}" 'unit B print' | grep '^2:' | cut -d: -f2 | sed 's/B$//')
+
+	mount_dir=$(mktemp -d image-mount-XXXXXX)	
+
+	mount -o loop,offset="${root_part_start}" "${mount_image}" "${mount_dir}"
+
+	hostname_file="${mount_dir}/etc/hostname"
+	timezone_file="${mount_dir}/etc/timezone"
+	wpa_supp_file="${mount_dir}/etc/wpa_supplicant/wpa_supplicant.conf"
+	ifaces_file="${mount_dir}/etc/network/interfaces"
+
+	set_hostname "${hostname_file}" "${hostname}"
+
+	set_timezone "${timezone_file}" "${tz}"
+
+	set_interfaces "${ifaces_file}"
+
+	set_wpa_supplicant "${wpa_supp_file}" "${ssid}" "${psk}"
+
+	cat ${hostname_file}
+	cat ${timezone_file}
+	cat ${ifaces_file}
+	cat ${wpa_supp_file}
+
+	umount -f "${mount_dir}"
+	rmdir -v "${mount_dir}"
+
+	exit 0
+}
+
+case "${action}" in
+	(download)
+		download_latest_image "${force}"
+		;;
+	(configure)
+		configure_raspbian_image "${image}" "${env}"
+		;;
+	('')
+		echo 'Error: missing action'
+		exit 1
+		;;
+esac
